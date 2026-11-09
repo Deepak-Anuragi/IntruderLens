@@ -6,17 +6,20 @@
 # ----------------------------------------------------------
 # 🔴 SENSITIVE: Captured intruder/owner photos — NEVER upload
 # ----------------------------------------------------------
-captures/
+captures/*
+!captures/.gitkeep
 
 # ----------------------------------------------------------
 # 🔴 SENSITIVE: Biometric data — face embeddings & reference photos
 # ----------------------------------------------------------
-trusted_faces/
+trusted_faces/*
+!trusted_faces/.gitkeep
 
 # ----------------------------------------------------------
 # 🔴 SENSITIVE: Operational log files
 # ----------------------------------------------------------
-logs/
+logs/*
+!logs/.gitkeep
 *.log
 
 # ----------------------------------------------------------
