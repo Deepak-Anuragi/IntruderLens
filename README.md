@@ -1,17 +1,12 @@
 <div align="center">
 
-<img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=30&duration=3000&pause=1000&color=00D4FF&center=true&vCenter=true&width=600&lines=IntruderLens+%F0%9F%94%90;Physical+Security+for+Your+Laptop;Silently+Watches.+Instantly+Alerts." alt="IntruderLens" />
+<h1 align="center">🔐 IntruderLens</h1>
 
-<br/>
+<p align="center">
+  <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&size=24&duration=3000&pause=1000&color=00D4FF&center=true&vCenter=true&width=550&lines=Physical+Security+for+Your+Laptop;Silently+Watches.+Instantly+Alerts.;100%25+Offline+Face+Recognition." alt="IntruderLens" />
+</p>
 
-```
-  ___       _                 _           _
- |_ _| _ _ | |_  _ _  _  _  __| | ___  _ _ | |   ___  _ _   ___
-  | | | ' \|  _|| '_|| || |/ _` |/ -_)| '_|| |__/ -_)| ' \ (_-<
- |___||_||_| \__||_|   \_,_|\__,_|\___||_|  |____\___||_||_|/__/
-```
-
-### 🔐 Stealth Physical Security Daemon for Windows — with Intelligent Face Whitelisting
+### Stealth Physical Security Daemon for Windows — with Intelligent Face Whitelisting
 
 <br/>
 
