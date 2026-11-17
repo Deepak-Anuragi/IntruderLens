@@ -1,0 +1,19 @@
+# Normalize line endings to LF on commit, checkout as CRLF on Windows
+* text=auto
+
+# Force LF for Python and Markdown files
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+
+# Binary files — no line ending conversion
+*.onnx binary
+*.jpg binary
+*.png binary
+*.exe binary
+*.zip binary
