@@ -22,7 +22,8 @@ Features:
    saves intruder evidence and dispatches instant warnings.
 
 4. Multi-Channel Alerts:
-   Optional instant dispatch via Telegram Bot API and TLS SMTP Email.
+   Optional instant dispatch via WhatsApp (Twilio) and TLS SMTP Email
+   (see notification_dispatcher.py).
 
 5. Guard Mode (Shortcut-Activated Watch Mode):
    Owner arms a watch mode with a custom global hotkey or typed password, without
@@ -86,13 +87,10 @@ except ImportError:
 # Apply Guard Mode settings saved via the CLI (intruder_lens.ini) before anything reads config
 guard_mode.load_overrides()
 
-# Standard library notification imports
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
-import urllib.request
-import urllib.parse
+try:
+    import notification_dispatcher
+except ImportError:
+    from . import notification_dispatcher
 
 # Global flag for graceful termination
 RUNNING = True
@@ -286,114 +284,6 @@ class CameraCaptureModule:
 
 
 # =============================================================================
-# OPTIONAL NOTIFICATION SUBSYSTEM (Telegram / SMTP)
-# =============================================================================
-
-def send_telegram_alert(image_path: str, incident_title: str, incident_details: dict) -> bool:
-    """Dispatches instant photo alert via Telegram Bot API."""
-    if not config.TELEGRAM_ENABLED:
-        return False
-
-    token = config.TELEGRAM_BOT_TOKEN
-    chat_id = config.TELEGRAM_CHAT_ID
-
-    if token == "YOUR_BOT_TOKEN_HERE" or not chat_id:
-        logger.warning("Telegram alert enabled but token/chat_id is not configured.")
-        return False
-
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
-    caption_lines = [
-        f"🚨 *{incident_title}*",
-        f"• *Host:* `{os.environ.get('COMPUTERNAME', 'Localhost')}`",
-        f"• *Timestamp:* `{incident_details.get('timestamp', datetime.now().isoformat())}`"
-    ]
-    for k, v in incident_details.items():
-        if k != "timestamp":
-            caption_lines.append(f"• *{k.replace('_', ' ').title()}:* `{v}`")
-
-    caption = "\n".join(caption_lines)
-
-    try:
-        boundary = "----IntruderLensBoundary" + str(int(time.time()))
-        body = bytearray()
-
-        body.extend(f"--{boundary}\r\n".encode())
-        body.extend(f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'.encode())
-        body.extend(f"--{boundary}\r\n".encode())
-        body.extend(f'Content-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n'.encode())
-        body.extend(f"--{boundary}\r\n".encode())
-        body.extend(b'Content-Disposition: form-data; name="parse_mode"\r\n\r\nMarkdown\r\n')
-
-        filename = os.path.basename(image_path)
-        body.extend(f"--{boundary}\r\n".encode())
-        body.extend(f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode())
-        body.extend(b"Content-Type: image/jpeg\r\n\r\n")
-
-        with open(image_path, "rb") as f:
-            body.extend(f.read())
-        body.extend(f"\r\n--{boundary}--\r\n".encode())
-
-        req = urllib.request.Request(url, data=bytes(body))
-        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if response.status == 200:
-                logger.info("Telegram alert dispatched successfully.")
-                return True
-            else:
-                logger.error(f"Telegram API returned status: {response.status}")
-                return False
-    except Exception as ex:
-        logger.error(f"Failed to dispatch Telegram alert: {ex}")
-        return False
-
-
-def send_email_alert(image_path: str, incident_title: str, incident_details: dict) -> bool:
-    """Dispatches instant photo alert via TLS SMTP Email."""
-    if not config.SMTP_ENABLED:
-        return False
-
-    if config.SMTP_USER == "your_email@gmail.com":
-        logger.warning("SMTP alert enabled but user credentials not configured.")
-        return False
-
-    try:
-        msg = MIMEMultipart()
-        msg["Subject"] = f"🚨 SECURITY ALERT: {incident_title} on {os.environ.get('COMPUTERNAME', 'Localhost')}"
-        msg["From"] = config.SMTP_USER
-        msg["To"] = config.SMTP_RECIPIENT
-
-        body_lines = [
-            f"IntruderLens Security Event: {incident_title}",
-            f"Host: {os.environ.get('COMPUTERNAME', 'Localhost')}",
-            f"Timestamp: {incident_details.get('timestamp', datetime.now().isoformat())}",
-            ""
-        ]
-        for k, v in incident_details.items():
-            if k != "timestamp":
-                body_lines.append(f"{k.replace('_', ' ').title()}: {v}")
-        body_lines.append("\nAttached is the photo captured by the laptop webcam.")
-
-        msg.attach(MIMEText("\n".join(body_lines), "plain"))
-
-        with open(image_path, "rb") as img_file:
-            img = MIMEImage(img_file.read(), name=os.path.basename(image_path))
-            msg.attach(img)
-
-        with smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT, timeout=15) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(config.SMTP_USER, config.SMTP_PASSWORD)
-            server.send_message(msg)
-
-        logger.info(f"Email alert sent successfully to {config.SMTP_RECIPIENT}")
-        return True
-    except Exception as ex:
-        logger.error(f"Failed to send SMTP email alert: {ex}")
-        return False
-
-
-# =============================================================================
 # UNIFIED SECURITY INCIDENT PROCESSOR WITH FACE WHITELISTS
 # =============================================================================
 
@@ -403,7 +293,7 @@ def process_security_trigger(trigger_source: str, details: dict, hardware_delay:
     1. Captures webcam burst silently.
     2. Runs Face Recognition if enabled.
     3. If recognized as Owner/Family: Suppresses warning and skips intruder alert.
-    4. If unknown or intruder: Saves photo and dispatches instant Telegram/Email alerts.
+    4. If unknown or intruder: Saves photo and dispatches instant WhatsApp/Email alerts.
     """
     logger.warning("=" * 65)
     logger.warning(f"🚨 SECURITY TRIGGER ACTIVATED: {trigger_source}")
@@ -470,15 +360,9 @@ def evaluate_frame_and_alert(frame, trigger_source: str, details: dict, prefix: 
     saved_path = CameraCaptureModule.save_frame_to_disk(frame, prefix=prefix)
 
     if saved_path and os.path.isfile(saved_path):
-        incident_info = {
-            "trigger_reason": trigger_source,
-            "recognition_result": recognition_result,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        incident_info.update(details)
-
-        send_telegram_alert(saved_path, f"Unauthorized Physical Access ({trigger_source})", incident_info)
-        send_email_alert(saved_path, f"Unauthorized Physical Access ({trigger_source})", incident_info)
+        logger.info(f"Incident: {trigger_source} | {recognition_result} | details={details}")
+        # Non-blocking: WhatsApp / Email are sent on a background thread
+        notification_dispatcher.send_alert(notification_dispatcher.classify_trigger(trigger_source), saved_path)
 
 
 # =============================================================================
@@ -1118,9 +1002,21 @@ def check_system_status():
     print(f"Guard Mode Enabled:       {config.GUARD_MODE_ENABLED} ({guard_mode.describe_controls()})")
     print(f"Guard Mode Triggers:      face={config.GUARD_MODE_TRIGGER_ON_FACE}, "
           f"keyboard={config.GUARD_MODE_TRIGGER_ON_KEYPRESS}, mouse={config.GUARD_MODE_TRIGGER_ON_MOUSE}")
-    print(f"Telegram Notifications:   {config.TELEGRAM_ENABLED}")
-    print(f"Email Notifications:      {config.SMTP_ENABLED}")
+    print(f"Notifications:            {notification_dispatcher.describe_channels()}")
     print("=" * 65)
+
+
+def test_notification_alert():
+    """Sends a test alert on every enabled channel, attaching the newest capture if one exists."""
+    photos = sorted(config.CAPTURES_DIR.glob("*.jpg"), key=lambda f: f.stat().st_mtime, reverse=True)
+    image_path = str(photos[0]) if photos else None
+    print(f"Channels: {notification_dispatcher.describe_channels()}")
+    print(f"Photo:    {image_path or '(none found in captures/ - sending text only)'}")
+    results = notification_dispatcher.test_alert(image_path)
+    if not results:
+        print("Nothing sent: enable NOTIFY_VIA_WHATSAPP and/or NOTIFY_VIA_EMAIL first.")
+    for channel, ok in results.items():
+        print(f"  {channel:<9} {'SENT' if ok else 'FAILED (see log above)'}")
 
 
 def setup_scheduled_task():
@@ -1237,6 +1133,8 @@ def main():
     parser.add_argument("--test-lid", action="store_true", help="Simulate a laptop lid-open trigger")
     parser.add_argument("--test-failed-logon", action="store_true", help="Simulate reaching 3 wrong password attempts")
     parser.add_argument("--status", action="store_true", help="Display system status and diagnostics report")
+    parser.add_argument("--test-alert", action="store_true",
+                        help="Send a test WhatsApp/Email alert with the most recent capture (if any)")
     parser.add_argument("--setup-task", action="store_true", help="Install Windows Scheduled Task for auto-start")
 
     # Face Enrollment & Whitelist CLI commands
@@ -1309,6 +1207,8 @@ def main():
         test_failed_logon_simulation()
     elif args.status:
         check_system_status()
+    elif args.test_alert:
+        test_notification_alert()
     elif args.setup_task:
         setup_scheduled_task()
     else:

@@ -73,7 +73,7 @@ Using offline **YuNet + SFace ONNX** models, IntruderLens compares the detected 
 <td width="50%">
 
 ### 📲 Instant Mobile Alerts
-Delivers the intruder's photo to your phone in under 1 second via **Telegram Bot API** or **TLS SMTP Email** — complete with timestamp, trigger reason, and device name.
+Sends the intruder's photo to your phone via **WhatsApp** (Twilio), **Email** (SMTP), or both. Each alert is short: what happened, when, and on which device. You can turn each channel on or off, or turn both off to only save photos to disk. Alerts are sent on a background thread, so the daemon keeps watching while they go out.
 
 </td>
 </tr>
@@ -150,7 +150,7 @@ Stepping away for a minute without locking? Press your custom hotkey (default **
     ▼                    ▼
 ACCESS GRANTED     🚨 INTRUDER
 Suppress Alert     Save Evidence
-Log silently       Send Telegram
+Log silently       Send WhatsApp
                    Send Email
 ```
 
@@ -166,7 +166,7 @@ Log silently       Send Telegram
 | **Camera Capture** | OpenCV + DirectShow | Headless burst capture on Windows |
 | **Event Monitoring** | pywin32 `win32evtlog` | Windows Security & System Event Log queries |
 | **Power Notifications** | Win32 `RegisterPowerSettingNotification` | Real-time lid/wake hardware events |
-| **Notifications** | Telegram Bot API + SMTP TLS | Instant photo alerts |
+| **Notifications** | Twilio WhatsApp API + SMTP STARTTLS | Photo alerts on a background thread |
 | **Service Runtime** | Windows Scheduled Task / NSSM | Silent background autostart |
 
 ---
@@ -179,6 +179,7 @@ IntruderLens/
 ├── 📄 intruder_lens.py     # Core daemon: event listeners, camera pipeline, face decisions, CLI
 ├── 📄 face_engine.py       # Offline face detection (YuNet) + recognition (SFace) engine
 ├── 📄 guard_mode.py        # Guard Mode: hotkey/password listener, input & face triggers
+├── 📄 notification_dispatcher.py  # WhatsApp (Twilio) + Email (SMTP) alert sender
 ├── 📄 config.py            # All settings — thresholds, paths, alert credentials
 ├── 📄 download_models.py   # One-command ONNX model downloader from OpenCV Zoo
 ├── 📄 service_wrapper.py   # Optional native pywin32 Windows Service wrapper
@@ -367,7 +368,7 @@ After activation there is a **5 s arming delay** so you can step away. Once arme
 - ⌨️ any key is pressed
 - 🖱️ the mouse/touchpad is moved, clicked or scrolled
 
-Every capture goes through face recognition: **your face → photo discarded, nothing saved**; anyone else (or no face visible) → saved to `captures/guard_*.jpg` and Telegram/Email alert sent.
+Every capture goes through face recognition: **your face → photo discarded, nothing saved**; anyone else (or no face visible) → saved to `captures/guard_*.jpg` and a WhatsApp/Email alert is sent.
 
 > Keyboard/mouse triggers wait a short grace period (`GUARD_MODE_INPUT_GRACE_SECONDS`, 2 s) before capturing. If you deactivate within that window, the capture is cancelled — so your own deactivation keystrokes never cause an alert.
 
@@ -389,23 +390,81 @@ python intruder_lens.py --use-guard-shortcuts
 
 ---
 
-## 📲 Setting Up Telegram Alerts *(Optional but Recommended)*
+## 📲 Setting Up WhatsApp & Email Alerts *(Optional but Recommended)*
 
-Get the intruder's photo delivered to your phone in under 1 second:
+When an intruder photo is saved, IntruderLens sends you a short alert:
 
-1. Open Telegram → search **@BotFather** → send `/newbot`
-2. Give your bot a name and username — copy the **Bot Token**
-3. Start a chat with your bot, then visit:
-   ```
-   https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
-   ```
-4. Copy your **`chat.id`** from the JSON response
-5. Update `config.py`:
-   ```python
-   TELEGRAM_ENABLED = True
-   TELEGRAM_BOT_TOKEN = "123456:ABC-your-token-here"
-   TELEGRAM_CHAT_ID  = "987654321"
-   ```
+```
+Intruder Lens Alert
+
+Activity : Unknown face detected while Guard Mode was active
+Time     : 20 Nov 2026, 09:41 PM
+Device   : MY-LAPTOP
+
+[Photo attached]
+Stay safe.
+```
+
+| Trigger | Activity text |
+| :--- | :--- |
+| Wrong passwords | 3 consecutive wrong password attempts detected |
+| Lid open / wake | Laptop lid opened or woken from sleep |
+| Guard Mode — face | Unknown face detected while Guard Mode was active |
+| Guard Mode — keyboard | Keyboard activity detected while Guard Mode was active |
+| Guard Mode — mouse | Mouse/touchpad activity detected while Guard Mode was active |
+
+Pick your channels in `config.py`:
+
+| `NOTIFY_VIA_WHATSAPP` | `NOTIFY_VIA_EMAIL` | Result |
+| :---: | :---: | :--- |
+| `True` | `False` | WhatsApp only |
+| `False` | `True` | Email only |
+| `True` | `True` | Both |
+| `False` | `False` | Silent mode: photo is only saved to disk |
+
+### 🔐 Where to put your credentials
+
+`config.py` is committed to git, so keep **only placeholders** in it. Put real values in the git-ignored `intruder_lens.ini`, using lower-case key names:
+
+```ini
+[notifications]
+notify_via_whatsapp = true
+notify_via_email = true
+twilio_account_sid = ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+twilio_auth_token = your-real-token
+owner_whatsapp_number = whatsapp:+91XXXXXXXXXX
+smtp_username = you@gmail.com
+smtp_password = abcd efgh ijkl mnop
+owner_email = you@gmail.com
+```
+
+You can also use environment variables prefixed with `INTRUDERLENS_`, such as `INTRUDERLENS_SMTP_PASSWORD`. Environment variables override the `.ini` file, and the `.ini` file overrides `config.py`.
+
+### WhatsApp (Twilio Sandbox)
+
+1. Create a free account at [twilio.com](https://www.twilio.com/). From the Console, copy your **Account SID** and **Auth Token**.
+2. Go to **Messaging → Try it out → Send a WhatsApp message**. Send the `join <code>` message it shows from your phone to the sandbox number (`+1 415 523 8886`).
+3. Set `twilio_account_sid`, `twilio_auth_token` and `owner_whatsapp_number` (e.g. `whatsapp:+919876543210`), then set `notify_via_whatsapp = true`.
+
+> **About the photo:** Twilio can only attach an image from a public URL. Before sending, IntruderLens uploads the photo to a temporary host that deletes it after 1 hour (`WHATSAPP_IMAGE_HOST = "litterbox"` by default, or `"imgbb"` with an `IMGBB_API_KEY`). Anyone who has that link can open the photo until it expires. Set `WHATSAPP_IMAGE_HOST = "none"` to send text-only WhatsApp alerts. If the upload fails, the text alert is still sent. The photo is always attached directly to emails.
+>
+> Sandbox sessions expire if you don't message the sandbox for 72 hours. Send `join <code>` again to re-activate.
+
+### Email (SMTP)
+
+| Provider | `SMTP_HOST` | `SMTP_PORT` |
+| :--- | :--- | :---: |
+| Gmail | `smtp.gmail.com` | `587` |
+| Outlook / Office 365 | `smtp.office365.com` | `587` |
+
+For Gmail, turn on 2-Step Verification, then create an **App Password** at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Use that as `smtp_password`, **not** your normal password. The email subject is `IntruderLens Alert — <activity>` and the photo is attached.
+
+### Test it
+
+```powershell
+python intruder_lens.py --test-alert   # sends a test alert with your newest capture
+python intruder_lens.py --status       # shows which channels are enabled
+```
 
 ---
 
@@ -434,8 +493,15 @@ All settings live in `config.py`. Key parameters:
 | `GUARD_MODE_TRIGGER_ON_FACE` / `_KEYPRESS` / `_MOUSE` | `True` | Which activity triggers a capture |
 | `GUARD_MODE_ARM_DELAY_SECONDS` | `5.0` | Time to step away after activating |
 | `GUARD_MODE_COOLDOWN_SECONDS` | `10.0` | Minimum gap between Guard Mode captures |
-| `TELEGRAM_ENABLED` | `False` | Enable Telegram Bot instant photo alerts |
-| `SMTP_ENABLED` | `False` | Enable Email instant photo alerts |
+| `NOTIFY_VIA_WHATSAPP` | `False` | Send WhatsApp alerts via Twilio |
+| `NOTIFY_VIA_EMAIL` | `False` | Send Email alerts via SMTP |
+| `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | placeholder | Twilio credentials (put real values in `intruder_lens.ini`) |
+| `TWILIO_WHATSAPP_FROM` | `"whatsapp:+14155238886"` | Twilio sandbox sender |
+| `OWNER_WHATSAPP_NUMBER` | placeholder | Your WhatsApp number, e.g. `whatsapp:+91…` |
+| `WHATSAPP_IMAGE_HOST` | `"litterbox"` | Temporary photo host for WhatsApp: `litterbox`, `imgbb`, or `none` |
+| `SMTP_HOST` / `SMTP_PORT` | `smtp.gmail.com` / `587` | SMTP server (Outlook: `smtp.office365.com`) |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | placeholder | SMTP login (Gmail: use an App Password) |
+| `OWNER_EMAIL` | placeholder | Where alert emails go |
 
 ---
 
@@ -446,8 +512,8 @@ IntruderLens was designed with **privacy-first principles**:
 - **🔒 Fully Local AI** — YuNet and SFace run entirely on-device via ONNX runtime. No biometric data ever leaves your machine.
 - **🔒 No Cloud Dependencies** — Face recognition, detection, and matching all happen offline. Works without internet.
 - **🔒 Gitignored Sensitive Data** — `captures/`, `trusted_faces/`, and `logs/` are permanently excluded from version control. Your photos and embeddings are yours alone.
-- **🔒 Placeholder Credentials Only** — The committed `config.py` contains no real tokens or passwords.
-- **🔒 Encrypted Alerts** — Telegram uses HTTPS. Email uses TLS STARTTLS. No plaintext transmission.
+- **🔒 Placeholder Credentials Only** — The committed `config.py` contains no real tokens or passwords. Real credentials go in the git-ignored `intruder_lens.ini` or in environment variables.
+- **🔒 Encrypted Alerts** — Twilio and photo uploads use HTTPS, and Email uses STARTTLS. Nothing is sent in plaintext. For WhatsApp, the photo sits on a temporary public link for up to 1 hour. Set `WHATSAPP_IMAGE_HOST = "none"` to avoid this.
 
 ---
 
@@ -460,8 +526,9 @@ IntruderLens was designed with **privacy-first principles**:
 - [x] Multi-user face enrollment (owner + unlimited family/friends)
 - [x] Intelligent alert suppression for authorized faces
 - [x] Silent headless DirectShow camera burst capture
-- [x] Telegram Bot instant photo alerts
-- [x] SMTP TLS email instant photo alerts
+- [x] WhatsApp photo alerts (Twilio)
+- [x] SMTP email photo alerts (Gmail / Outlook)
+- [x] Choose alert channels independently: WhatsApp, Email, both, or silent
 - [x] Windows Scheduled Task silent autostart
 - [x] Built-in simulation & diagnostic CLI tools
 - [x] Guard Mode — hotkey/password-armed watch mode (face, keyboard, mouse/touchpad triggers)

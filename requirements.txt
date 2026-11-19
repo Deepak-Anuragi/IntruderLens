@@ -15,3 +15,6 @@ keyboard>=0.13.5
 
 # Guard Mode: mouse & touchpad activity trigger
 mouse>=0.7.1
+
+# Notifications: WhatsApp alerts via the Twilio API (Email uses the standard library)
+twilio>=9.0.0

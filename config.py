@@ -85,15 +85,39 @@ GUARD_MODE_COOLDOWN_SECONDS = 10.0          # Minimum time between successive Gu
 GUARD_MODE_FACE_POLL_SECONDS = 1.0          # How often the webcam is scanned for a face while guarding
 GUARD_MODE_MOUSE_MOVE_THRESHOLD_PX = 15     # Ignore mouse jitter smaller than this (pixels from armed position)
 
-# Optional Telegram Notification Settings
-TELEGRAM_ENABLED = False
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
+# =============================================================================
+# Notifications (WhatsApp + Email) — see notification_dispatcher.py
+# =============================================================================
+# 🔴 Keep ONLY placeholder values in this file — it is committed to git.
+# Put real credentials in a [notifications] section of intruder_lens.ini (git-ignored),
+# using lower-case key names (e.g. twilio_auth_token = ...), or in environment variables
+# prefixed INTRUDERLENS_ (e.g. INTRUDERLENS_SMTP_PASSWORD). Both override the values below.
 
-# Optional SMTP Email Notification Settings
-SMTP_ENABLED = False
-SMTP_SERVER = "smtp.gmail.com"
+# --- Notification Channels ---
+# Both False = silent mode (photo is only saved to disk)
+NOTIFY_VIA_WHATSAPP = False     # True to enable WhatsApp alerts
+NOTIFY_VIA_EMAIL = False        # True to enable Email alerts
+
+# --- WhatsApp (Twilio) ---
+TWILIO_ACCOUNT_SID = "YOUR_TWILIO_SID_HERE"
+TWILIO_AUTH_TOKEN = "YOUR_TWILIO_AUTH_TOKEN_HERE"
+TWILIO_WHATSAPP_FROM = "whatsapp:+14155238886"        # Twilio sandbox number
+OWNER_WHATSAPP_NUMBER = "whatsapp:+91XXXXXXXXXX"      # owner's WhatsApp number
+
+# Twilio can only attach a photo from a public URL, so the capture is uploaded to a
+# temporary host first (it auto-deletes after 1 hour). If the upload fails, the text
+# alert is still sent.
+#   "litterbox" = litterbox.catbox.moe, no account needed (default)
+#   "imgbb"     = api.imgbb.com, requires IMGBB_API_KEY
+#   "none"      = never upload the photo; WhatsApp alerts are text-only
+WHATSAPP_IMAGE_HOST = "litterbox"
+IMGBB_API_KEY = "YOUR_IMGBB_API_KEY_HERE"
+
+# --- Email (SMTP) ---
+# Gmail:   smtp.gmail.com     port 587 (needs a Gmail App Password)
+# Outlook: smtp.office365.com port 587
+SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
-SMTP_USER = "your_email@gmail.com"
-SMTP_PASSWORD = "your_app_password"
-SMTP_RECIPIENT = "alerts@example.com"
+SMTP_USERNAME = "your_email@gmail.com"
+SMTP_PASSWORD = "your_app_password_here"   # Gmail App Password, NOT main password
+OWNER_EMAIL = "owner_email@gmail.com"
