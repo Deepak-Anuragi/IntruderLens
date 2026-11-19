@@ -116,6 +116,7 @@ IMGBB_API_KEY = "YOUR_IMGBB_API_KEY_HERE"
 # --- Email (SMTP) ---
 # Gmail:   smtp.gmail.com     port 587 (needs a Gmail App Password)
 # Outlook: smtp.office365.com port 587
+# Port 587 uses STARTTLS; port 465 uses implicit SSL (both supported)
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USERNAME = "your_email@gmail.com"

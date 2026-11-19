@@ -258,8 +258,11 @@ class CameraCaptureModule:
             import cv2
             ensure_directories()
             timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{prefix}_{timestamp_str}.jpg"
-            output_filepath = config.CAPTURES_DIR / filename
+            output_filepath = config.CAPTURES_DIR / f"{prefix}_{timestamp_str}.jpg"
+            n = 2
+            while output_filepath.exists():  # Never overwrite evidence captured within the same second
+                output_filepath = config.CAPTURES_DIR / f"{prefix}_{timestamp_str}_{n}.jpg"
+                n += 1
 
             encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY]
             success = cv2.imwrite(str(output_filepath), frame, encode_params)
@@ -366,6 +369,39 @@ def evaluate_frame_and_alert(frame, trigger_source: str, details: dict, prefix: 
 
 
 # =============================================================================
+# EVENT LOG QUERY HELPERS
+# =============================================================================
+
+EVENT_XML_NS = {"ns": "http://schemas.microsoft.com/win/2004/08/events/event"}
+
+
+def _latest_record_id(channel: str, condition: str) -> int | None:
+    """Returns the newest EventRecordID matching `condition` in `channel` (None if no such event).
+    Raises if the channel cannot be queried (e.g. Security log without admin rights)."""
+    import win32evtlog
+    h_query = win32evtlog.EvtQuery(
+        channel,
+        win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryReverseDirection,
+        f"*[System[{condition}]]"
+    )
+    events = win32evtlog.EvtNext(h_query, 1)
+    if not events:
+        return None
+    root = ET.fromstring(win32evtlog.EvtRender(events[0], win32evtlog.EvtRenderEventXml))
+    rec_elem = root.find("./ns:System/ns:EventRecordID", EVENT_XML_NS)
+    return int(rec_elem.text) if rec_elem is not None and rec_elem.text else None
+
+
+def _query_events_after(channel: str, condition: str, last_record_id: int | None):
+    """Opens a query for events matching `condition` newer than `last_record_id`.
+    Filtering by EventRecordID in XPath avoids re-reading the whole log on every poll."""
+    import win32evtlog
+    if last_record_id is not None:
+        condition = f"({condition}) and EventRecordID > {int(last_record_id)}"
+    return win32evtlog.EvtQuery(channel, win32evtlog.EvtQueryChannelPath, f"*[System[{condition}]]")
+
+
+# =============================================================================
 # SECURITY EVENT LOG LISTENER (3x WRONG PASSWORDS)
 # =============================================================================
 
@@ -377,33 +413,33 @@ class WindowsSecurityEventListener:
     Tracks failures in a sliding window and triggers response upon reaching threshold.
     """
 
+    QUERY_CONDITION = "(EventID=4625 or EventID=4624)"
+
     def __init__(self):
         self.failed_attempts_queue = collections.deque()
         self.last_capture_timestamp = 0.0
         self.last_record_id = None
-        self.xml_namespaces = {"ns": "http://schemas.microsoft.com/win/2004/08/events/event"}
+        self.watermark_ready = False      # True once we know where "now" is in the log
+        self._access_warned = False       # Log an unreadable Security log once, not every poll
+        self.xml_namespaces = EVENT_XML_NS
 
-    def initialize_watermark(self):
+    def initialize_watermark(self) -> bool:
         """Sets watermark to latest existing record so only real-time new events are processed."""
         try:
-            import win32evtlog
-            h_query = win32evtlog.EvtQuery(
-                "Security",
-                win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryReverseDirection,
-                "*[System[(EventID=4625 or EventID=4624)]]"
-            )
-            events = win32evtlog.EvtNext(h_query, 1)
-            if events:
-                xml_content = win32evtlog.EvtRender(events[0], win32evtlog.EvtRenderEventXml)
-                root = ET.fromstring(xml_content)
-                rec_elem = root.find("./ns:System/ns:EventRecordID", self.xml_namespaces)
-                if rec_elem is not None and rec_elem.text:
-                    self.last_record_id = int(rec_elem.text)
-                    logger.info(f"Security Log watermark initialized at RecordID: {self.last_record_id}")
+            self.last_record_id = _latest_record_id("Security", self.QUERY_CONDITION)
+            self.watermark_ready = True
+            self._access_warned = False
+            if self.last_record_id is not None:
+                logger.info(f"Security Log watermark initialized at RecordID: {self.last_record_id}")
             else:
                 logger.info("Security log initialized. Listening from current head.")
         except Exception as e:
-            logger.warning(f"Could not initialize Security watermark: {e}")
+            if not self._access_warned:
+                logger.warning(f"Could not read the Security log (run as Administrator to monitor wrong passwords): {e}")
+                self._access_warned = True
+            else:
+                logger.debug(f"Security log still unreadable: {e}")
+        return self.watermark_ready
 
     def parse_event_xml(self, xml_content: str) -> dict | None:
         """Parses raw Windows Event XML into structured fields."""
@@ -455,15 +491,16 @@ class WindowsSecurityEventListener:
         except ImportError:
             return
 
-        query_xpath = "*[System[(EventID=4625 or EventID=4624)]]"
+        # Without a watermark we would replay the whole historical log as "live" failures
+        if not self.watermark_ready and not self.initialize_watermark():
+            return
+
         try:
-            h_query = win32evtlog.EvtQuery(
-                "Security",
-                win32evtlog.EvtQueryChannelPath,
-                query_xpath
-            )
+            h_query = _query_events_after("Security", self.QUERY_CONDITION, self.last_record_id)
         except Exception as e:
-            logger.error(f"Failed to query Windows Security Event Log: {e}")
+            if not self._access_warned:
+                logger.error(f"Failed to query Windows Security Event Log: {e}")
+                self._access_warned = True
             return
 
         while RUNNING:
@@ -511,24 +548,24 @@ class WindowsSecurityEventListener:
                 logger.debug(f"Ignoring non-interactive logon failure (Type: {logon_type}, User: {user})")
                 return
 
-            self.failed_attempts_queue.append((now, event))
-            logger.warning(
-                f"[LOGON FAILED] Wrong password attempt for user '{user}' "
-                f"(LogonType {logon_type}, Status: {event['failure_status']}). "
-                f"Failures in window: {len(self.failed_attempts_queue)}/{config.FAILED_ATTEMPT_THRESHOLD}"
-            )
-
-            # Prune attempts outside rolling window
+            # Prune attempts outside rolling window before counting
             cutoff = now - config.ROLLING_WINDOW_SECONDS
             while self.failed_attempts_queue and self.failed_attempts_queue[0][0] < cutoff:
                 self.failed_attempts_queue.popleft()
+            self.failed_attempts_queue.append((now, event))
 
             current_count = len(self.failed_attempts_queue)
+            logger.warning(
+                f"[LOGON FAILED] Wrong password attempt for user '{user}' "
+                f"(LogonType {logon_type}, Status: {event['failure_status']}). "
+                f"Failures in window: {current_count}/{config.FAILED_ATTEMPT_THRESHOLD}"
+            )
+
             if current_count >= config.FAILED_ATTEMPT_THRESHOLD:
                 if (now - self.last_capture_timestamp) >= config.COOLDOWN_SECONDS:
                     self.last_capture_timestamp = now
                     process_security_trigger(
-                        trigger_source=f"3x Wrong Password Attempts ({config.FAILED_ATTEMPT_THRESHOLD} failures)",
+                        trigger_source=f"{config.FAILED_ATTEMPT_THRESHOLD}x Wrong Password Attempts",
                         details={
                             "target_account": event.get("target_user", "Unknown"),
                             "logon_type": event.get("logon_type", "Interactive")
@@ -552,33 +589,33 @@ class LaptopLidAndWakeListener:
     2. Real-Time Win32 Power Setting Notifications (GUID_LIDSWITCH_STATE_CHANGE).
     """
 
+    QUERY_CONDITION = ("Provider[@Name='Microsoft-Windows-Kernel-Power' or "
+                       "@Name='Microsoft-Windows-Power-Troubleshooter'] and "
+                       "(EventID=507 or EventID=107 or EventID=1)")
+
     def __init__(self):
         self.last_wake_record_id = None
         self.last_lid_capture_time = 0.0
-        self.xml_namespaces = {"ns": "http://schemas.microsoft.com/win/2004/08/events/event"}
+        self.watermark_ready = False
+        self._query_warned = False
+        # Lid triggers arrive from both the main poll loop and the Win32 hook thread
+        self._trigger_lock = threading.Lock()
+        self.xml_namespaces = EVENT_XML_NS
 
-    def initialize_watermark(self):
+    def initialize_watermark(self) -> bool:
         """Sets watermark to latest existing System log wake events."""
         try:
-            import win32evtlog
-            query = "*[System[Provider[@Name='Microsoft-Windows-Kernel-Power' or @Name='Microsoft-Windows-Power-Troubleshooter'] and (EventID=507 or EventID=107 or EventID=1)]]"
-            h_query = win32evtlog.EvtQuery(
-                "System",
-                win32evtlog.EvtQueryChannelPath | win32evtlog.EvtQueryReverseDirection,
-                query
-            )
-            events = win32evtlog.EvtNext(h_query, 1)
-            if events:
-                xml_content = win32evtlog.EvtRender(events[0], win32evtlog.EvtRenderEventXml)
-                root = ET.fromstring(xml_content)
-                rec_elem = root.find("./ns:System/ns:EventRecordID", self.xml_namespaces)
-                if rec_elem is not None and rec_elem.text:
-                    self.last_wake_record_id = int(rec_elem.text)
-                    logger.info(f"System Wake watermark initialized at RecordID: {self.last_wake_record_id}")
+            self.last_wake_record_id = _latest_record_id("System", self.QUERY_CONDITION)
+            self.watermark_ready = True
+            if self.last_wake_record_id is not None:
+                logger.info(f"System Wake watermark initialized at RecordID: {self.last_wake_record_id}")
             else:
                 logger.info("System log initialized. Listening for wake/lid events.")
         except Exception as e:
-            logger.warning(f"Could not initialize System wake watermark: {e}")
+            if not self._query_warned:
+                logger.warning(f"Could not initialize System wake watermark: {e}")
+                self._query_warned = True
+        return self.watermark_ready
 
     def poll_system_log(self):
         """Polls Windows System log for Kernel-Power and Power-Troubleshooter wake events."""
@@ -590,15 +627,16 @@ class LaptopLidAndWakeListener:
         except ImportError:
             return
 
-        query = "*[System[Provider[@Name='Microsoft-Windows-Kernel-Power' or @Name='Microsoft-Windows-Power-Troubleshooter'] and (EventID=507 or EventID=107 or EventID=1)]]"
+        # Without a watermark every historical wake event would fire a capture
+        if not self.watermark_ready and not self.initialize_watermark():
+            return
+
         try:
-            h_query = win32evtlog.EvtQuery(
-                "System",
-                win32evtlog.EvtQueryChannelPath,
-                query
-            )
+            h_query = _query_events_after("System", self.QUERY_CONDITION, self.last_wake_record_id)
         except Exception as e:
-            logger.error(f"Failed to query Windows System Event Log: {e}")
+            if not self._query_warned:
+                logger.error(f"Failed to query Windows System Event Log: {e}")
+                self._query_warned = True
             return
 
         while RUNNING:
@@ -676,12 +714,13 @@ class LaptopLidAndWakeListener:
 
     def trigger_lid_or_wake_capture(self, trigger_type: str, details: dict):
         """Debounces and triggers capture & face verification when laptop lid opens."""
-        now = time.time()
-        if (now - self.last_lid_capture_time) < config.LID_COOLDOWN_SECONDS:
-            logger.debug(f"Lid/wake event detected, but cooldown active ({config.LID_COOLDOWN_SECONDS}s). Skipping snapshot.")
-            return
+        with self._trigger_lock:
+            now = time.time()
+            if (now - self.last_lid_capture_time) < config.LID_COOLDOWN_SECONDS:
+                logger.debug(f"Lid/wake event detected, but cooldown active ({config.LID_COOLDOWN_SECONDS}s). Skipping snapshot.")
+                return
+            self.last_lid_capture_time = now
 
-        self.last_lid_capture_time = now
         process_security_trigger(
             trigger_source=f"Laptop Opened ({trigger_type})",
             details=details,
@@ -698,6 +737,9 @@ def start_win32_power_notification_thread(lid_listener: LaptopLidAndWakeListener
     Registers a hidden Win32 message window for real-time power notifications:
     - GUID_LIDSWITCH_STATE_CHANGE: Triggered instantly when lid is physically opened.
     - GUID_CONSOLE_DISPLAY_STATE: Triggered when laptop screen powers on.
+
+    Windows broadcasts the *current* value of each setting right after registration, so
+    only a real transition (closed -> open, off -> on) fires a capture.
     """
     def message_loop():
         try:
@@ -706,49 +748,31 @@ def start_win32_power_notification_thread(lid_listener: LaptopLidAndWakeListener
                     ('Data1', wintypes.DWORD),
                     ('Data2', wintypes.WORD),
                     ('Data3', wintypes.WORD),
-                    ('Data4', wintypes.BYTE * 8)
+                    ('Data4', ctypes.c_ubyte * 8)
                 ]
 
-            guid_lid = GUID(0xBA3E0F4D, 0xB817, 0x4094, (wintypes.BYTE * 8)(0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3))
-            guid_display = GUID(0x6FE69556, 0x704A, 0x47A0, (wintypes.BYTE * 8)(0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47))
+            guid_lid = GUID(0xBA3E0F4D, 0xB817, 0x4094, (ctypes.c_ubyte * 8)(0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3))
+            guid_display = GUID(0x6FE69556, 0x704A, 0x47A0, (ctypes.c_ubyte * 8)(0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47))
+            watched = {
+                bytes(guid_lid): ("lid", "Physical Laptop Lid Opened", "Win32_LidSwitch",
+                                  "[WIN32 POWER] Physical Lid Opened signal received!"),
+                bytes(guid_display): ("display", "Display Turned On", "Win32_DisplayState",
+                                      "[WIN32 POWER] Display powered on signal received."),
+            }
+            last_state = {}  # setting -> last value (0 = closed/off, 1 = open/on, 2 = dimmed)
 
-            user32 = ctypes.windll.user32
-            kernel32 = ctypes.windll.kernel32
+            # Private DLL instances with full 64-bit-safe prototypes (handles/LPARAMs are pointer-sized)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+            LRESULT = ctypes.c_ssize_t
             WM_POWERBROADCAST = 0x0218
             PBT_POWERSETTINGCHANGE = 0x8013
             DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000
+            PM_REMOVE = 0x0001
 
-            WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+            WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
-            class POWERBROADCAST_SETTING(ctypes.Structure):
-                _fields_ = [
-                    ('PowerSetting', GUID),
-                    ('DataLength', wintypes.DWORD),
-                    ('Data', wintypes.BYTE * 1)
-                ]
-
-            def wnd_proc(hwnd, msg, wparam, lparam):
-                if msg == WM_POWERBROADCAST and wparam == PBT_POWERSETTINGCHANGE:
-                    try:
-                        p_setting = ctypes.cast(lparam, ctypes.POINTER(POWERBROADCAST_SETTING)).contents
-                        setting_guid = p_setting.PowerSetting
-                        if setting_guid.Data1 == guid_lid.Data1:
-                            lid_state = p_setting.Data[0]
-                            if lid_state == 1:
-                                logger.info("[WIN32 POWER] Physical Lid Opened signal received!")
-                                lid_listener.trigger_lid_or_wake_capture("Physical Laptop Lid Opened", {"source": "Win32_LidSwitch"})
-                        elif setting_guid.Data1 == guid_display.Data1:
-                            display_state = p_setting.Data[0]
-                            if display_state == 1:
-                                logger.info("[WIN32 POWER] Display powered on signal received.")
-                                lid_listener.trigger_lid_or_wake_capture("Display Turned On", {"source": "Win32_DisplayState"})
-                    except Exception as err:
-                        logger.debug(f"Error handling power setting change: {err}")
-                    return 1
-                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-            wndclass_proc = WNDPROC(wnd_proc)
             class WNDCLASS(ctypes.Structure):
                 _fields_ = [
                     ('style', wintypes.UINT),
@@ -763,34 +787,107 @@ def start_win32_power_notification_thread(lid_listener: LaptopLidAndWakeListener
                     ('lpszClassName', wintypes.LPCWSTR)
                 ]
 
-            class_name = f"IntruderLens_PowerHook_{os.getpid()}"
+            class POWERBROADCAST_SETTING(ctypes.Structure):
+                _fields_ = [
+                    ('PowerSetting', GUID),
+                    ('DataLength', wintypes.DWORD),
+                    ('Data', ctypes.c_ubyte * 1)
+                ]
+
+            kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+            user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.DefWindowProcW.restype = LRESULT
+            user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASS)]
+            user32.RegisterClassW.restype = wintypes.ATOM
+            user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+            user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                               ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                               wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+            user32.CreateWindowExW.restype = wintypes.HWND
+            user32.DestroyWindow.argtypes = [wintypes.HWND]
+            user32.RegisterPowerSettingNotification.argtypes = [wintypes.HANDLE, ctypes.POINTER(GUID), wintypes.DWORD]
+            user32.RegisterPowerSettingNotification.restype = wintypes.HANDLE
+            user32.UnregisterPowerSettingNotification.argtypes = [wintypes.HANDLE]
+            user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+            user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            user32.DispatchMessageW.restype = LRESULT
+
+            def on_setting_change(lparam):
+                p_setting = ctypes.cast(lparam, ctypes.POINTER(POWERBROADCAST_SETTING)).contents
+                info = watched.get(bytes(p_setting.PowerSetting))
+                if info is None or p_setting.DataLength < 1:
+                    return
+                key, trigger_type, source, message = info
+                value = p_setting.Data[0]
+                previous = last_state.get(key)
+                last_state[key] = value
+                if previous is None:
+                    logger.debug(f"[WIN32 POWER] Initial {key} state = {value} (not a trigger).")
+                    return
+                if previous == 0 and value == 1:
+                    logger.info(message)
+                    # Capture off the message thread so the window keeps pumping messages
+                    threading.Thread(
+                        target=lid_listener.trigger_lid_or_wake_capture,
+                        args=(trigger_type, {"source": source}),
+                        daemon=True, name="Win32PowerCapture",
+                    ).start()
+
+            def wnd_proc(hwnd, msg, wparam, lparam):
+                if msg == WM_POWERBROADCAST and wparam == PBT_POWERSETTINGCHANGE and lparam:
+                    try:
+                        on_setting_change(lparam)
+                    except Exception as err:
+                        logger.debug(f"Error handling power setting change: {err}")
+                    return 1
+                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            wndclass_proc = WNDPROC(wnd_proc)  # keep a reference for the window's lifetime
+            class_name = f"IntruderLens_PowerHook_{os.getpid()}_{threading.get_ident()}"
             wc = WNDCLASS()
             wc.lpfnWndProc = wndclass_proc
             wc.hInstance = kernel32.GetModuleHandleW(None)
             wc.lpszClassName = class_name
-            user32.RegisterClassW(ctypes.byref(wc))
+            if not user32.RegisterClassW(ctypes.byref(wc)):
+                logger.error(f"Win32 power hook: RegisterClassW failed (error {ctypes.get_last_error()}).")
+                return
 
             hwnd = user32.CreateWindowExW(
                 0, class_name, "IntruderLensMsgWindow",
                 0, 0, 0, 0, 0,
-                0, 0, wc.hInstance, 0
+                None, None, wc.hInstance, None
             )
+            if not hwnd:
+                logger.error(f"Win32 power hook: CreateWindowExW failed (error {ctypes.get_last_error()}). "
+                             "Lid-open detection falls back to the System event log.")
+                user32.UnregisterClassW(class_name, wc.hInstance)
+                return
 
-            if hwnd:
-                user32.RegisterPowerSettingNotification(hwnd, ctypes.byref(guid_lid), DEVICE_NOTIFY_WINDOW_HANDLE)
-                user32.RegisterPowerSettingNotification(hwnd, ctypes.byref(guid_display), DEVICE_NOTIFY_WINDOW_HANDLE)
-                logger.info("Win32 Real-Time Lid-Switch & Display Power Notifications registered.")
+            handles = [user32.RegisterPowerSettingNotification(hwnd, ctypes.byref(g), DEVICE_NOTIFY_WINDOW_HANDLE)
+                       for g in (guid_lid, guid_display)]
+            if not all(handles):
+                logger.warning(f"Win32 power hook: some power notifications could not be registered "
+                               f"(error {ctypes.get_last_error()}).")
+            logger.info("Win32 Real-Time Lid-Switch & Display Power Notifications registered.")
 
-                msg = wintypes.MSG()
+            msg = wintypes.MSG()
+            try:
                 while RUNNING:
-                    has_msg = user32.PeekMessageW(ctypes.byref(msg), hwnd, 0, 0, 1)
-                    if has_msg:
+                    if user32.PeekMessageW(ctypes.byref(msg), hwnd, 0, 0, PM_REMOVE):
                         user32.TranslateMessage(ctypes.byref(msg))
                         user32.DispatchMessageW(ctypes.byref(msg))
                     else:
                         time.sleep(0.1)
+            finally:
+                for h in handles:
+                    if h:
+                        user32.UnregisterPowerSettingNotification(h)
+                user32.DestroyWindow(hwnd)
+                user32.UnregisterClassW(class_name, wc.hInstance)
         except Exception as e:
-            logger.debug(f"Win32 power notification hook stopped: {e}")
+            logger.error(f"Win32 power notification hook stopped: {e}")
 
     th = threading.Thread(target=message_loop, daemon=True, name="Win32PowerHook")
     th.start()
@@ -843,7 +940,6 @@ def stop_guard_mode(controller):
 
 def test_guard_mode():
     """Starts Guard Mode immediately (no event-log listeners) for hands-on testing."""
-    global RUNNING
     print("=" * 65)
     print("IntruderLens: Guard Mode Live Test")
     print("=" * 65)
@@ -1063,8 +1159,6 @@ def signal_handler(signum, frame):
 
 def run_daemon():
     """Runs the main IntruderLens security daemon."""
-    global RUNNING
-
     print(r"""
   ___       _                 _           _                      
  |_ _| _ _ | |_  _ _  _  _  __| | ___  _ _ | |   ___  _ _   ___  
@@ -1184,7 +1278,10 @@ def main():
             engine.enroll_face_from_webcam(args.enroll_face)
     elif args.enroll_face_image:
         name, path = args.enroll_face_image
-        engine.enroll_face_from_image(name, Path(path))
+        if not engine.is_ready:
+            print("[ERROR] Face models are missing. Run: python download_models.py")
+        else:
+            engine.enroll_face_from_image(name, Path(path))
     elif args.list_faces:
         profiles = engine.list_enrolled_profiles()
         print("\n" + "=" * 50)

@@ -5,7 +5,6 @@ Allows running IntruderLens as a native background Windows Service via pywin32.
 
 import sys
 import os
-import time
 from pathlib import Path
 
 # Ensure user site-packages and pywin32 DLL directories are available in Service context
@@ -66,15 +65,22 @@ class IntruderLensService(win32serviceutil.ServiceFramework):
 
     def main(self):
         intruder_lens.logger.info("IntruderLens Windows Service is initializing...")
-        intruder_lens.secure_directories()
+        intruder_lens.ensure_directories()
 
         listener = intruder_lens.WindowsSecurityEventListener()
         listener.initialize_watermark()
+
+        lid_listener = intruder_lens.LaptopLidAndWakeListener()
+        if config.LID_OPEN_CAPTURE_ENABLED:
+            lid_listener.initialize_watermark()
+            intruder_lens.start_win32_power_notification_thread(lid_listener)
 
         intruder_lens.logger.info("IntruderLens Service loop entered.")
 
         while self.is_running and intruder_lens.RUNNING:
             listener.poll_events()
+            if config.LID_OPEN_CAPTURE_ENABLED:
+                lid_listener.poll_system_log()
             # Wait for stop event or poll interval timeout
             rc = win32event.WaitForSingleObject(self.stop_event, int(config.POLL_INTERVAL_SECONDS * 1000))
             if rc == win32event.WAIT_OBJECT_0:

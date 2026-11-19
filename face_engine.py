@@ -4,8 +4,6 @@ Powered by OpenCV YuNet (Ultra-fast Face Detection) & SFace (Face Recognition ON
 Zero external heavy dependencies required: 100% offline, local, and hardware-accelerated.
 """
 
-import os
-import sys
 import json
 import logging
 import threading
@@ -72,6 +70,23 @@ class FaceRecognitionEngine:
         except Exception as e:
             logger.error(f"Failed to load OpenCV face recognition models: {e}")
 
+    @staticmethod
+    def _valid_person_name(person_name: str) -> Optional[str]:
+        """Returns the cleaned name, or None if it is empty or unsafe as a folder name."""
+        name = (person_name or "").strip()
+        if not name or name in (".", "..") or any(ch in name for ch in '\\/:*?"<>|') or name.endswith("."):
+            print(f"[ERROR] Invalid person name '{person_name}'. Use letters, digits, spaces, '-' or '_'.")
+            return None
+        return name
+
+    @staticmethod
+    def _next_free_path(folder: Path, stem: str) -> Path:
+        """Returns folder/stem_N.jpg for the first N that does not exist yet."""
+        n = 1
+        while (folder / f"{stem}_{n}.jpg").exists():
+            n += 1
+        return folder / f"{stem}_{n}.jpg"
+
     @property
     def is_ready(self) -> bool:
         return self.detector is not None and self.recognizer is not None
@@ -113,9 +128,8 @@ class FaceRecognitionEngine:
 
     def enroll_face_from_image(self, person_name: str, image_path: Path) -> bool:
         """Enrolls a trusted face from an existing image file on disk."""
-        person_name = person_name.strip()
+        person_name = self._valid_person_name(person_name)
         if not person_name:
-            print("[ERROR] Person name cannot be empty.")
             return False
 
         if not Path(image_path).exists():
@@ -144,11 +158,7 @@ class FaceRecognitionEngine:
         # Save photo into user's folder
         user_dir = self.whitelist_dir / person_name
         user_dir.mkdir(parents=True, exist_ok=True)
-        n = 1
-        while (user_dir / f"ref_{n}.jpg").exists():
-            n += 1
-        target_path = user_dir / f"ref_{n}.jpg"
-        cv2.imwrite(str(target_path), img)
+        cv2.imwrite(str(self._next_free_path(user_dir, "ref")), img)
 
         # Store in profiles
         if person_name not in self.known_profiles:
@@ -164,9 +174,8 @@ class FaceRecognitionEngine:
         Interactively captures multiple facial samples from the webcam
         to capture different slight angles and lighting conditions for robust matching.
         """
-        person_name = person_name.strip()
+        person_name = self._valid_person_name(person_name)
         if not person_name:
-            print("[ERROR] Person name cannot be empty.")
             return False
 
         if not self.is_ready:
@@ -174,13 +183,12 @@ class FaceRecognitionEngine:
             return False
 
         user_dir = self.whitelist_dir / person_name
-        user_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"\n=======================================================")
+        print("\n=======================================================")
         print(f" Enrolling Trusted Face for: '{person_name}'")
-        print(f" Please look directly at the webcam...")
+        print(" Please look directly at the webcam...")
         print(f" Capturing {num_samples} high-confidence facial angles.")
-        print(f"=======================================================\n")
+        print("=======================================================\n")
 
         cap = cv2.VideoCapture(config.CAMERA_INDEX, cv2.CAP_DSHOW)
         if not cap.isOpened():
@@ -219,8 +227,9 @@ class FaceRecognitionEngine:
                     if feat is not None:
                         sample_count += 1
                         collected_features.append(feat)
-                        save_path = user_dir / f"sample_{sample_count}.jpg"
-                        cv2.imwrite(str(save_path), frame)
+                        user_dir.mkdir(parents=True, exist_ok=True)
+                        # Never overwrite photos from an earlier enrollment of the same person
+                        cv2.imwrite(str(self._next_free_path(user_dir, "sample")), frame)
                         print(f" -> Captured sample {sample_count}/{num_samples} (Confidence: {score:.1%})")
                         time.sleep(0.4)  # Slight pause for varied expression/angle
             time.sleep(0.1)
@@ -264,8 +273,10 @@ class FaceRecognitionEngine:
                     data = json.load(f)
                 for name, feat_list in data.items():
                     self.known_profiles[name] = [np.array(f, dtype=np.float32) for f in feat_list]
-                logger.info(f"Loaded {len(self.known_profiles)} trusted face profiles from cache.")
-                return
+                if self.known_profiles:
+                    logger.info(f"Loaded {len(self.known_profiles)} trusted face profiles from cache.")
+                    return
+                # Empty cache: fall through so photos placed in trusted_faces/<name>/ get indexed
             except Exception as e:
                 logger.warning(f"Could not load cached embeddings, re-indexing photos: {e}")
 
@@ -273,16 +284,20 @@ class FaceRecognitionEngine:
         if self.whitelist_dir.exists() and self.is_ready:
             for user_folder in self.whitelist_dir.iterdir():
                 if user_folder.is_dir():
-                    name = user_folder.name
-                    self.known_profiles[name] = []
-                    for img_file in user_folder.glob("*.jpg"):
+                    feats = []
+                    for img_file in sorted(user_folder.iterdir()):
+                        if img_file.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                            continue
                         img = cv2.imread(str(img_file))
                         if img is not None:
                             faces = self.order_faces(self.detect_faces(img))
                             if faces:
                                 feat = self.extract_features(img, faces[0])
                                 if feat is not None:
-                                    self.known_profiles[name].append(feat)
+                                    feats.append(feat)
+                    if feats:
+                        self.known_profiles[user_folder.name] = feats
+                        logger.info(f"Indexed {len(feats)} face photo(s) for '{user_folder.name}' from {user_folder}")
             if self.known_profiles:
                 self.save_known_profiles()
 

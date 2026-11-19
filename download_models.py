@@ -9,7 +9,6 @@ Run this once after cloning:
 """
 
 import urllib.request
-import hashlib
 from pathlib import Path
 
 MODELS_DIR = Path(__file__).resolve().parent / "models"

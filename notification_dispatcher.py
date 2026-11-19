@@ -57,7 +57,7 @@ TRIGGER_GUARD_KEYPRESS = "guard_keypress"
 TRIGGER_GUARD_MOUSE = "guard_mouse"
 
 ACTIVITY_DESCRIPTIONS = {
-    TRIGGER_WRONG_PASSWORD: "3 consecutive wrong password attempts detected",
+    TRIGGER_WRONG_PASSWORD: "{threshold} wrong password attempts detected",
     TRIGGER_LID_OPEN: "Laptop lid opened or woken from sleep",
     TRIGGER_GUARD_FACE: "Unknown face detected while Guard Mode was active",
     TRIGGER_GUARD_KEYPRESS: "Keyboard activity detected while Guard Mode was active",
@@ -96,9 +96,15 @@ def classify_trigger(trigger_source: str) -> str:
     return TRIGGER_LID_OPEN
 
 
+def describe_activity(trigger_type: str) -> str:
+    """One-line activity description for a TRIGGER_* type (uses the configured password threshold)."""
+    template = ACTIVITY_DESCRIPTIONS.get(trigger_type, "Suspicious activity detected")
+    return template.format(threshold=getattr(config, "FAILED_ATTEMPT_THRESHOLD", 3))
+
+
 def build_message(trigger_type: str, photo_attached: bool = True, when: datetime | None = None) -> str:
     """Builds the fixed-format alert text shared by WhatsApp and Email."""
-    activity = ACTIVITY_DESCRIPTIONS.get(trigger_type, "Suspicious activity detected")
+    activity = describe_activity(trigger_type)
     when = when or datetime.now()
     timestamp = when.strftime("%d %b %Y, %I:%M %p")   # e.g. 20 Nov 2026, 09:41 PM
     device = os.environ.get("COMPUTERNAME", "Unknown device")
@@ -266,7 +272,7 @@ def _send_email(trigger_type: str, image_path: str | None, settings: dict) -> bo
         return False
     try:
         has_photo = bool(image_path and os.path.isfile(image_path))
-        activity = ACTIVITY_DESCRIPTIONS.get(trigger_type, "Suspicious activity detected")
+        activity = describe_activity(trigger_type)
 
         msg = MIMEMultipart()
         msg["Subject"] = f"IntruderLens Alert — {activity}"
@@ -282,11 +288,17 @@ def _send_email(trigger_type: str, image_path: str | None, settings: dict) -> bo
             part.add_header("Content-Disposition", "attachment", filename=os.path.basename(image_path))
             msg.attach(part)
 
-        with smtplib.SMTP(settings["SMTP_HOST"], int(settings.get("SMTP_PORT") or 587),
-                          timeout=_HTTP_TIMEOUT) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
+        port = int(settings.get("SMTP_PORT") or 587)
+        if port == 465:
+            # Implicit TLS (SMTPS), e.g. smtp.gmail.com:465
+            server_cm = smtplib.SMTP_SSL(settings["SMTP_HOST"], port, timeout=_HTTP_TIMEOUT)
+        else:
+            server_cm = smtplib.SMTP(settings["SMTP_HOST"], port, timeout=_HTTP_TIMEOUT)
+        with server_cm as server:
+            if port != 465:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
             server.login(settings["SMTP_USERNAME"], settings["SMTP_PASSWORD"])
             server.send_message(msg)
 
