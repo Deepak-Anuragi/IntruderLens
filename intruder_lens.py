@@ -445,7 +445,8 @@ def evaluate_frame_and_alert(frame, trigger_source: str, details: dict, prefix: 
             logger.warning("Face recognition engine is not ready (models missing). Treating as unknown.")
 
     # Decision Matrix: Authorized Owner vs Unknown Intruder
-    if is_whitelisted and matched_name:
+    # The check above ran on the in-memory frame; nothing has been written to disk yet.
+    if is_whitelisted and matched_name and config.IGNORE_AUTHORIZED_FACES:
         logger.info("=" * 65)
         logger.info(f"🟢 ACCESS GRANTED: Trusted Person Recognized: '{matched_name}' (Score: {match_score:.3f})")
         logger.info("Suppressing intruder alert — no warning will be dispatched.")
@@ -455,18 +456,23 @@ def evaluate_frame_and_alert(frame, trigger_source: str, details: dict, prefix: 
             CameraCaptureModule.save_frame_to_disk(frame, prefix=f"authorized_{matched_name}")
         return
 
-    # Unknown person / Intruder detected!
-    logger.warning("=" * 65)
-    logger.warning("🔴 UNAUTHORIZED / UNKNOWN PERSON IN FRONT OF LAPTOP!")
-    logger.warning("Saving intruder evidence and dispatching alerts to owner...")
-    logger.warning("=" * 65)
+    if is_whitelisted and matched_name:
+        # IGNORE_AUTHORIZED_FACES = False: trusted faces are still saved and reported
+        logger.info(f"Trusted person '{matched_name}' recognized, but IGNORE_AUTHORIZED_FACES is off. Alerting anyway.")
+        recognition_result = f"Trusted person: {matched_name} (score {match_score:.3f})"
+    else:
+        recognition_result = "Unknown / Unrecognized Person"
+        logger.warning("=" * 65)
+        logger.warning("🔴 UNAUTHORIZED / UNKNOWN PERSON IN FRONT OF LAPTOP!")
+        logger.warning("Saving intruder evidence and dispatching alerts to owner...")
+        logger.warning("=" * 65)
 
     saved_path = CameraCaptureModule.save_frame_to_disk(frame, prefix=prefix)
 
     if saved_path and os.path.isfile(saved_path):
         incident_info = {
             "trigger_reason": trigger_source,
-            "recognition_result": "Unknown / Unrecognized Person",
+            "recognition_result": recognition_result,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         incident_info.update(details)
@@ -1234,7 +1240,10 @@ def main():
     parser.add_argument("--setup-task", action="store_true", help="Install Windows Scheduled Task for auto-start")
 
     # Face Enrollment & Whitelist CLI commands
-    parser.add_argument("--enroll-face", type=str, metavar="NAME", help="Enroll a trusted person via live webcam (e.g. --enroll-face Deepak)")
+    parser.add_argument("--enroll-face", type=str, metavar="NAME",
+                        help="Enroll a trusted person via live webcam, or from a photo with --image "
+                             "(e.g. --enroll-face Deepak --image C:/path/photo.jpg)")
+    parser.add_argument("--image", type=str, metavar="PATH", help="Photo to enroll with --enroll-face (skips the webcam)")
     parser.add_argument("--enroll-face-image", nargs=2, metavar=("NAME", "PATH"), help="Enroll a trusted person from photo on disk (e.g. --enroll-face-image Deepak C:/path/photo.jpg)")
     parser.add_argument("--list-faces", action="store_true", help="List all enrolled trusted faces in the whitelist")
     parser.add_argument("--remove-face", type=str, metavar="NAME", help="Remove an enrolled person from the whitelist")
@@ -1248,6 +1257,8 @@ def main():
     parser.add_argument("--use-guard-shortcuts", action="store_true", help="Switch Guard Mode from password back to shortcuts")
 
     args = parser.parse_args()
+    if args.image and not args.enroll_face:
+        parser.error("--image must be used together with --enroll-face NAME")
 
     # Config-only commands: no need to load the face models
     if args.set_guard_shortcuts:
@@ -1267,7 +1278,12 @@ def main():
     if args.test_guard:
         test_guard_mode()
     elif args.enroll_face:
-        engine.enroll_face_from_webcam(args.enroll_face)
+        if not engine.is_ready:
+            print("[ERROR] Face models are missing. Run: python download_models.py")
+        elif args.image:
+            engine.enroll_face_from_image(args.enroll_face, Path(args.image))
+        else:
+            engine.enroll_face_from_webcam(args.enroll_face)
     elif args.enroll_face_image:
         name, path = args.enroll_face_image
         engine.enroll_face_from_image(name, Path(path))

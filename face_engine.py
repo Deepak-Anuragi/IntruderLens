@@ -91,6 +91,13 @@ class FaceRecognitionEngine:
             _, faces = self.detector.detect(image)
         return faces
 
+    @staticmethod
+    def order_faces(faces: Optional[np.ndarray]) -> List[np.ndarray]:
+        """Returns detected faces sorted largest-and-most-confident first (YuNet output is unordered)."""
+        if faces is None or len(faces) == 0:
+            return []
+        return sorted(faces, key=lambda f: float(f[2]) * float(f[3]) * float(f[-1]), reverse=True)
+
     def extract_features(self, image: np.ndarray, face_box: np.ndarray) -> Optional[np.ndarray]:
         """Aligns and crops a detected face, then computes its 128D SFace feature embedding."""
         if not self.is_ready:
@@ -120,10 +127,12 @@ class FaceRecognitionEngine:
             print(f"[ERROR] Failed to load image: {image_path}")
             return False
 
-        faces = self.detect_faces(img)
-        if faces is None or len(faces) == 0:
+        faces = self.order_faces(self.detect_faces(img))
+        if not faces:
             print(f"[ERROR] No face detected in {image_path}. Please use a clear, well-lit photo.")
             return False
+        if len(faces) > 1:
+            print(f"[WARN] {len(faces)} faces found in {image_path}; enrolling the largest one only.")
 
         # Pick the largest/most confident face
         primary_face = faces[0]
@@ -135,8 +144,10 @@ class FaceRecognitionEngine:
         # Save photo into user's folder
         user_dir = self.whitelist_dir / person_name
         user_dir.mkdir(parents=True, exist_ok=True)
-        target_img_name = f"ref_{len(list(user_dir.glob('*.jpg'))) + 1}.jpg"
-        target_path = user_dir / target_img_name
+        n = 1
+        while (user_dir / f"ref_{n}.jpg").exists():
+            n += 1
+        target_path = user_dir / f"ref_{n}.jpg"
         cv2.imwrite(str(target_path), img)
 
         # Store in profiles
@@ -200,8 +211,8 @@ class FaceRecognitionEngine:
                 time.sleep(0.1)
                 continue
 
-            faces = self.detect_faces(frame)
-            if faces is not None and len(faces) > 0:
+            faces = self.order_faces(self.detect_faces(frame))
+            if len(faces) == 1:  # Exactly one person in view, so we never enroll a bystander
                 score = faces[0][-1]
                 if score >= 0.70:  # High confidence face
                     feat = self.extract_features(frame, faces[0])
@@ -267,23 +278,37 @@ class FaceRecognitionEngine:
                     for img_file in user_folder.glob("*.jpg"):
                         img = cv2.imread(str(img_file))
                         if img is not None:
-                            faces = self.detect_faces(img)
-                            if faces is not None and len(faces) > 0:
+                            faces = self.order_faces(self.detect_faces(img))
+                            if faces:
                                 feat = self.extract_features(img, faces[0])
                                 if feat is not None:
                                     self.known_profiles[name].append(feat)
             if self.known_profiles:
                 self.save_known_profiles()
 
+    def _best_match(self, feature: np.ndarray) -> Tuple[Optional[str], float]:
+        """Returns (best_matching_name, best_cosine_score) for one face embedding across all profiles."""
+        best_name, best_score = None, -1.0
+        for name, enrolled_feats in self.known_profiles.items():
+            for ref_feat in enrolled_feats:
+                with self._model_lock:
+                    score = self.recognizer.match(feature, ref_feat, cv2.FaceRecognizerSF_FR_COSINE)
+                if score > best_score:
+                    best_name, best_score = name, score
+        return best_name, best_score
+
     def identify_face(self, frame: np.ndarray, tolerance: Optional[float] = None) -> Tuple[bool, Optional[str], float, Optional[np.ndarray]]:
         """
-        Analyzes a captured frame:
-        1. Detects face(s).
-        2. Compares against all enrolled profiles in the whitelist.
-        3. Returns (is_whitelisted, matched_name, best_score, primary_face_box).
+        Analyzes a captured frame (in memory, before anything is written to disk):
+        1. Detects every face in the frame.
+        2. Compares each one against all enrolled profiles in the whitelist.
+        3. The frame is whitelisted only if EVERY detected face matches a trusted profile,
+           so a stranger standing next to the owner still triggers an alert.
 
-        :param tolerance: Cosine similarity threshold (defaults to COSINE_THRESHOLD = 0.363).
-        :return: (is_whitelisted: bool, matched_name: str or None, best_score: float, face_box: np.ndarray or None)
+        :param tolerance: Cosine similarity threshold (defaults to config.FACE_MATCH_THRESHOLD).
+        :return: (is_whitelisted, matched_name(s) or None, score, primary_face_box or None).
+                 When whitelisted, score is the weakest match among the faces; otherwise it is
+                 the best score of the first unrecognized face.
         """
         if not self.is_ready:
             # If models not loaded, treat as unknown / not whitelisted
@@ -291,37 +316,37 @@ class FaceRecognitionEngine:
 
         threshold = tolerance if tolerance is not None else getattr(config, "FACE_MATCH_THRESHOLD", self.COSINE_THRESHOLD)
 
-        faces = self.detect_faces(frame)
-        if faces is None or len(faces) == 0:
+        faces = self.order_faces(self.detect_faces(frame))
+        if not faces:
             logger.info("Face recognition: No face detected in frame.")
             return False, None, 0.0, None
 
-        # Sort faces by detection score and area to check the primary person
         primary_face = faces[0]
-        test_feature = self.extract_features(frame, primary_face)
-        if test_feature is None:
+        if not self.known_profiles:
+            logger.info("Face recognition: no trusted faces enrolled. Treating frame as unknown.")
             return False, None, 0.0, primary_face
 
-        best_match_name = None
-        best_score = -1.0
+        matched_names: List[str] = []
+        weakest = float("inf")
+        for idx, face in enumerate(faces):
+            feature = self.extract_features(frame, face)
+            if feature is None:
+                logger.warning(f"Face recognition: could not encode face #{idx + 1}. Treating frame as unknown.")
+                return False, None, 0.0, primary_face
+            name, score = self._best_match(feature)
+            if score < threshold:
+                logger.warning(
+                    f"🚨 UNRECOGNIZED FACE / INTRUDER DETECTED! Face {idx + 1}/{len(faces)} "
+                    f"best score {score:.4f} < {threshold:.4f}"
+                )
+                return False, None, score, primary_face
+            if name not in matched_names:
+                matched_names.append(name)
+            weakest = min(weakest, score)
 
-        for name, enrolled_feats in self.known_profiles.items():
-            for ref_feat in enrolled_feats:
-                # SFace cosine similarity match
-                with self._model_lock:
-                    score = self.recognizer.match(test_feature, ref_feat, cv2.FaceRecognizerSF_FR_COSINE)
-                if score > best_score:
-                    best_score = score
-                    if score >= threshold:
-                        best_match_name = name
-
-        is_whitelisted = best_match_name is not None
-        if is_whitelisted:
-            logger.info(f"✅ FACE MATCHED! Authorized Person: '{best_match_name}' (Score: {best_score:.4f} >= {threshold:.4f})")
-        else:
-            logger.warning(f"🚨 UNRECOGNIZED FACE / INTRUDER DETECTED! (Highest score was {best_score:.4f} < {threshold:.4f})")
-
-        return is_whitelisted, best_match_name, best_score, primary_face
+        label = ", ".join(matched_names)
+        logger.info(f"✅ FACE MATCHED! Authorized: '{label}' ({len(faces)} face(s), weakest score {weakest:.4f} >= {threshold:.4f})")
+        return True, label, weakest, primary_face
 
     def list_enrolled_profiles(self) -> Dict[str, int]:
         """Returns dict of enrolled names and their number of samples."""

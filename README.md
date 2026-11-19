@@ -257,7 +257,7 @@ python intruder_lens.py --enroll-face "Mom"
 python intruder_lens.py --enroll-face "Brother"
 
 # Or enroll from an existing photo file
-python intruder_lens.py --enroll-face-image "Deepak" "C:\Users\Deepak\photo.jpg"
+python intruder_lens.py --enroll-face "Deepak" --image "C:\Users\Deepak\photo.jpg"
 
 # Verify who is enrolled
 python intruder_lens.py --list-faces
@@ -344,7 +344,7 @@ python intruder_lens.py --list-faces
 python intruder_lens.py --enroll-face "Sister"
 
 # Add someone from a photo file
-python intruder_lens.py --enroll-face-image "Sister" "C:\photos\sister.jpg"
+python intruder_lens.py --enroll-face "Sister" --image "C:\photos\sister.jpg"
 
 # Remove someone from whitelist
 python intruder_lens.py --remove-face "Sister"
@@ -423,7 +423,7 @@ All settings live in `config.py`. Key parameters:
 | `LID_HARDWARE_SETTLE_SECONDS` | `0.8` | Delay after wake for USB camera to power up |
 | `FACE_RECOGNITION_ENABLED` | `True` | Enable intelligent face whitelist comparison |
 | `FACE_MATCH_THRESHOLD` | `0.35` | Cosine similarity cutoff (higher = stricter matching) |
-| `IGNORE_AUTHORIZED_FACES` | `True` | Suppress all alerts when owner/family detected |
+| `IGNORE_AUTHORIZED_FACES` | `True` | Skip saving and alerting when every face in the photo is enrolled (a stranger next to the owner still triggers an alert). `False` saves and alerts for trusted faces too |
 | `CAMERA_INDEX` | `0` | Webcam device index (0 = primary/built-in) |
 | `GUARD_MODE_ENABLED` | `True` | Start the Guard Mode listener with the daemon |
 | `GUARD_MODE_ACTIVATE_SHORTCUT` | `"ctrl+shift+g"` | Hotkey to arm Guard Mode |
