@@ -64,6 +64,27 @@ WARMUP_FRAMES = 5                   # Frames to discard for auto-exposure/white 
 BURST_FRAMES_COUNT = 3              # Number of frames to evaluate for sharpness
 JPEG_QUALITY = 95                   # High quality JPEG compression (0 - 100)
 
+# Guard Mode (Manual Shortcut-Activated Watch Mode)
+# Activate/deactivate with a global hotkey (2-3 simultaneous keys, e.g. "ctrl+shift+g")
+# or, when GUARD_MODE_USE_PASSWORD is True, by typing a secret password anywhere.
+# Values can also be changed from the CLI (--set-guard-shortcuts / --set-guard-password);
+# CLI changes are persisted to intruder_lens.ini (git-ignored) and override the values below.
+GUARD_MODE_ENABLED = True                   # Master switch: start the Guard Mode hotkey listener with the daemon
+GUARD_MODE_ACTIVATE_SHORTCUT = "ctrl+shift+g"    # user-customizable
+GUARD_MODE_DEACTIVATE_SHORTCUT = "ctrl+shift+s"  # user-customizable
+GUARD_MODE_USE_PASSWORD = False             # True = use typed password instead of shortcut
+GUARD_MODE_PASSWORD = ""                    # optional typed password (activates Guard Mode)
+GUARD_MODE_DEACTIVATE_PASSWORD = ""         # optional separate deactivation password ("" = same as GUARD_MODE_PASSWORD)
+GUARD_MODE_TRIGGER_ON_FACE = True           # capture if face detected
+GUARD_MODE_TRIGGER_ON_KEYPRESS = True       # capture if key pressed
+GUARD_MODE_TRIGGER_ON_MOUSE = True          # capture if mouse/touchpad activity
+
+GUARD_MODE_ARM_DELAY_SECONDS = 5.0          # Grace period after activation so the owner can step away
+GUARD_MODE_INPUT_GRACE_SECONDS = 2.0        # Delay before an input-triggered capture; cancelled if Guard Mode is deactivated meanwhile
+GUARD_MODE_COOLDOWN_SECONDS = 10.0          # Minimum time between successive Guard Mode captures
+GUARD_MODE_FACE_POLL_SECONDS = 1.0          # How often the webcam is scanned for a face while guarding
+GUARD_MODE_MOUSE_MOVE_THRESHOLD_PX = 15     # Ignore mouse jitter smaller than this (pixels from armed position)
+
 # Optional Telegram Notification Settings
 TELEGRAM_ENABLED = False
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"

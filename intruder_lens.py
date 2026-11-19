@@ -24,6 +24,11 @@ Features:
 4. Multi-Channel Alerts:
    Optional instant dispatch via Telegram Bot API and TLS SMTP Email.
 
+5. Guard Mode (Shortcut-Activated Watch Mode):
+   Owner arms a watch mode with a custom global hotkey or typed password, without
+   locking the screen. Any face, keypress, or mouse/touchpad activity triggers a
+   silent capture that runs through the same face-whitelist and alert pipeline.
+
 Target OS: Windows 10 / Windows 11
 =============================================================================
 """
@@ -72,6 +77,14 @@ try:
     from face_engine import FaceRecognitionEngine
 except ImportError:
     from .face_engine import FaceRecognitionEngine
+
+try:
+    import guard_mode
+except ImportError:
+    from . import guard_mode
+
+# Apply Guard Mode settings saved via the CLI (intruder_lens.ini) before anything reads config
+guard_mode.load_overrides()
 
 # Standard library notification imports
 import smtplib
@@ -171,12 +184,22 @@ class CameraCaptureModule:
     or persists the clearest frame.
     """
 
+    # Optional callable() -> frame | None. Set while Guard Mode holds the webcam open so
+    # other triggers reuse that handle instead of failing to open the device twice.
+    shared_frame_source = None
+
     @staticmethod
     def capture_best_frame(hardware_delay: float = 0.0):
         """
         Silently captures burst frames from webcam and returns the sharpest (best_frame, sharpness_score).
         Does not write to disk yet, enabling in-memory face recognition before deciding to save.
         """
+        source = CameraCaptureModule.shared_frame_source
+        if source is not None:
+            frame = source()
+            if frame is not None:
+                return frame, 0.0
+
         if hardware_delay > 0:
             logger.debug(f"Waiting {hardware_delay:.2f}s for camera hardware power stabilization...")
             time.sleep(hardware_delay)
@@ -387,10 +410,27 @@ def process_security_trigger(trigger_source: str, details: dict, hardware_delay:
     logger.warning("Acquiring silent webcam frame for facial analysis...")
     logger.warning("=" * 65)
 
-    frame, sharpness = CameraCaptureModule.capture_best_frame(hardware_delay=hardware_delay)
+    frame, _ = CameraCaptureModule.capture_best_frame(hardware_delay=hardware_delay)
     if frame is None:
         logger.error("Webcam capture returned no valid frame. Camera may be busy or unavailable.")
         return
+
+    prefix = "intruder" if "Password" in trigger_source else "lid_open"
+    evaluate_frame_and_alert(frame, trigger_source, details, prefix=prefix)
+
+
+def evaluate_frame_and_alert(frame, trigger_source: str, details: dict, prefix: str = "intruder",
+                             save_authorized: bool | None = None):
+    """
+    Runs face recognition on an already-captured frame.
+    - Owner / whitelisted face: suppress alert (optionally save as authorized_*).
+    - Unknown face, no face, or nobody enrolled: save to captures/ and dispatch alerts.
+
+    :param save_authorized: Override config.SAVE_AUTHORIZED_SESSIONS (Guard Mode passes False
+                            so owner frames are always discarded).
+    """
+    if save_authorized is None:
+        save_authorized = config.SAVE_AUTHORIZED_SESSIONS
 
     # Face Recognition & Whitelist Matching
     is_whitelisted = False
@@ -411,7 +451,7 @@ def process_security_trigger(trigger_source: str, details: dict, hardware_delay:
         logger.info("Suppressing intruder alert — no warning will be dispatched.")
         logger.info("=" * 65)
 
-        if config.SAVE_AUTHORIZED_SESSIONS:
+        if save_authorized:
             CameraCaptureModule.save_frame_to_disk(frame, prefix=f"authorized_{matched_name}")
         return
 
@@ -421,7 +461,6 @@ def process_security_trigger(trigger_source: str, details: dict, hardware_delay:
     logger.warning("Saving intruder evidence and dispatching alerts to owner...")
     logger.warning("=" * 65)
 
-    prefix = "intruder" if "Password" in trigger_source else "lid_open"
     saved_path = CameraCaptureModule.save_frame_to_disk(frame, prefix=prefix)
 
     if saved_path and os.path.isfile(saved_path):
@@ -869,8 +908,118 @@ def start_win32_power_notification_thread(lid_listener: LaptopLidAndWakeListener
 
 
 # =============================================================================
+# GUARD MODE INTEGRATION
+# =============================================================================
+
+def _guard_face_present(frame) -> bool | None:
+    """Face-presence check used by Guard Mode's webcam watch. None if the engine is offline."""
+    engine = get_face_engine()
+    if not engine.is_ready:
+        return None
+    faces = engine.detect_faces(frame)
+    return faces is not None and len(faces) > 0
+
+
+def _guard_process_frame(frame, trigger_source: str, details: dict):
+    """Guard Mode captures: owner frames are always discarded, never saved."""
+    logger.warning("=" * 65)
+    logger.warning(f"🚨 SECURITY TRIGGER ACTIVATED: {trigger_source}")
+    logger.warning("=" * 65)
+    evaluate_frame_and_alert(frame, trigger_source, details, prefix="guard", save_authorized=False)
+
+
+def start_guard_mode() -> "guard_mode.GuardModeController | None":
+    """Creates and starts the Guard Mode controller (hotkey/password listener + worker thread)."""
+    controller = guard_mode.GuardModeController(
+        process_frame=_guard_process_frame,
+        fallback_capture=lambda: CameraCaptureModule.capture_best_frame()[0],
+        face_detector=_guard_face_present,
+    )
+    if not controller.start():
+        return None
+    CameraCaptureModule.shared_frame_source = controller.borrow_best_frame
+    return controller
+
+
+def stop_guard_mode(controller):
+    if controller is not None:
+        CameraCaptureModule.shared_frame_source = None
+        controller.stop()
+
+
+# =============================================================================
 # CLI UTILITIES & TEST COMMANDS
 # =============================================================================
+
+def test_guard_mode():
+    """Starts Guard Mode immediately (no event-log listeners) for hands-on testing."""
+    global RUNNING
+    print("=" * 65)
+    print("IntruderLens: Guard Mode Live Test")
+    print("=" * 65)
+    get_face_engine()
+    controller = start_guard_mode()
+    if controller is None:
+        print("[FAILED] Guard Mode could not start. Check the log output above.")
+        return
+
+    signal.signal(signal.SIGINT, signal_handler)
+    controller.activate("--test-guard CLI")
+    print(f"Guard Mode is ACTIVE. It arms in {config.GUARD_MODE_ARM_DELAY_SECONDS:.0f}s.")
+    print(f"Controls: {guard_mode.describe_controls()}")
+    print("Touch the keyboard/mouse or show your face to trigger a capture. Ctrl+C to exit.\n")
+    try:
+        while RUNNING:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_guard_mode(controller)
+        print("Guard Mode test stopped.")
+
+
+def set_guard_shortcuts(activate: str, deactivate: str):
+    """CLI: validates and persists custom activate/deactivate hotkeys."""
+    try:
+        activate = guard_mode.validate_shortcut(activate)
+        deactivate = guard_mode.validate_shortcut(deactivate)
+    except ValueError as ex:
+        print(f"[ERROR] {ex}")
+        return
+    guard_mode.save_overrides(
+        GUARD_MODE_ACTIVATE_SHORTCUT=activate,
+        GUARD_MODE_DEACTIVATE_SHORTCUT=deactivate,
+        GUARD_MODE_USE_PASSWORD=False,
+    )
+    note = " (same key toggles on/off)" if activate == deactivate else ""
+    print(f"[SUCCESS] Guard Mode shortcuts saved: activate='{activate}', deactivate='{deactivate}'{note}")
+    print(f"Stored in {config.CONFIG_FILE}. Restart the daemon to apply.")
+
+
+def set_guard_password(values: list[str]):
+    """CLI: persists an activation password (and optional separate deactivation password)."""
+    activate_pw = values[0]
+    deactivate_pw = values[1] if len(values) > 1 else ""
+    for pw in (activate_pw, deactivate_pw):
+        if pw and (len(pw) < 4 or any(len(ch) != 1 or not ch.isprintable() for ch in pw)):
+            print("[ERROR] Passwords must be at least 4 printable characters.")
+            return
+    if deactivate_pw == activate_pw:
+        deactivate_pw = ""
+    guard_mode.save_overrides(
+        GUARD_MODE_PASSWORD=activate_pw,
+        GUARD_MODE_DEACTIVATE_PASSWORD=deactivate_pw,
+        GUARD_MODE_USE_PASSWORD=True,
+    )
+    print("[SUCCESS] Guard Mode password mode enabled: " + guard_mode.describe_controls())
+    print(f"Stored in {config.CONFIG_FILE} (git-ignored). Restart the daemon to apply.")
+
+
+def use_guard_shortcuts():
+    """CLI: switches Guard Mode back from password to shortcut control."""
+    guard_mode.save_overrides(GUARD_MODE_USE_PASSWORD=False)
+    print("[SUCCESS] Guard Mode now uses shortcuts: " + guard_mode.describe_controls())
+
 
 def test_camera():
     """Snaps an immediate test image and displays path and status."""
@@ -960,6 +1109,9 @@ def check_system_status():
     print(f"Wrong Password Threshold: {config.FAILED_ATTEMPT_THRESHOLD} attempts in {config.ROLLING_WINDOW_SECONDS}s")
     print(f"Lid-Open Capture Enabled: {config.LID_OPEN_CAPTURE_ENABLED} (Cooldown: {config.LID_COOLDOWN_SECONDS}s)")
     print(f"Ignore Authorized Faces:  {config.IGNORE_AUTHORIZED_FACES}")
+    print(f"Guard Mode Enabled:       {config.GUARD_MODE_ENABLED} ({guard_mode.describe_controls()})")
+    print(f"Guard Mode Triggers:      face={config.GUARD_MODE_TRIGGER_ON_FACE}, "
+          f"keyboard={config.GUARD_MODE_TRIGGER_ON_KEYPRESS}, mouse={config.GUARD_MODE_TRIGGER_ON_MOUSE}")
     print(f"Telegram Notifications:   {config.TELEGRAM_ENABLED}")
     print(f"Email Notifications:      {config.SMTP_ENABLED}")
     print("=" * 65)
@@ -1052,6 +1204,11 @@ def run_daemon():
         start_win32_power_notification_thread(lid_listener)
         logger.info(f"Laptop Lid-Open & Wake Detection active. Cooldown: {config.LID_COOLDOWN_SECONDS}s.")
 
+    # 3. Initialize Guard Mode hotkey/password listener (background threads)
+    guard_controller = None
+    if config.GUARD_MODE_ENABLED:
+        guard_controller = start_guard_mode()
+
     logger.info("IntruderLens is actively guarding this machine. Press Ctrl+C to terminate.")
 
     try:
@@ -1063,6 +1220,7 @@ def run_daemon():
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received.")
     finally:
+        stop_guard_mode(guard_controller)
         logger.info("IntruderLens Daemon successfully stopped.")
 
 
@@ -1081,10 +1239,34 @@ def main():
     parser.add_argument("--list-faces", action="store_true", help="List all enrolled trusted faces in the whitelist")
     parser.add_argument("--remove-face", type=str, metavar="NAME", help="Remove an enrolled person from the whitelist")
 
+    # Guard Mode CLI commands
+    parser.add_argument("--test-guard", action="store_true", help="Activate Guard Mode immediately for a live test")
+    parser.add_argument("--set-guard-shortcuts", nargs=2, metavar=("ACTIVATE", "DEACTIVATE"),
+                        help="Set Guard Mode hotkeys, 2-3 keys each (e.g. --set-guard-shortcuts ctrl+shift+g ctrl+shift+s)")
+    parser.add_argument("--set-guard-password", nargs="+", metavar="PASSWORD",
+                        help="Use a typed password for Guard Mode: ACTIVATE_PW [DEACTIVATE_PW]")
+    parser.add_argument("--use-guard-shortcuts", action="store_true", help="Switch Guard Mode from password back to shortcuts")
+
     args = parser.parse_args()
+
+    # Config-only commands: no need to load the face models
+    if args.set_guard_shortcuts:
+        set_guard_shortcuts(*args.set_guard_shortcuts)
+        return
+    if args.set_guard_password:
+        if len(args.set_guard_password) > 2:
+            parser.error("--set-guard-password takes 1 or 2 passwords")
+        set_guard_password(args.set_guard_password)
+        return
+    if args.use_guard_shortcuts:
+        use_guard_shortcuts()
+        return
+
     engine = get_face_engine()
 
-    if args.enroll_face:
+    if args.test_guard:
+        test_guard_mode()
+    elif args.enroll_face:
         engine.enroll_face_from_webcam(args.enroll_face)
     elif args.enroll_face_image:
         name, path = args.enroll_face_image

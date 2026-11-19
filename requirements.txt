@@ -9,3 +9,9 @@ opencv-python>=4.8.0.76
 
 # (Optional) numpy — required by opencv-python, included automatically
 numpy>=1.24.0
+
+# Guard Mode: global hotkey / typed-password listener and keypress trigger
+keyboard>=0.13.5
+
+# Guard Mode: mouse & touchpad activity trigger
+mouse>=0.7.1

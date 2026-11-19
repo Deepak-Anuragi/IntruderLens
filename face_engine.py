@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import numpy as np
@@ -41,6 +42,8 @@ class FaceRecognitionEngine:
         self.detector = None
         self.recognizer = None
         self.known_profiles: Dict[str, List[np.ndarray]] = {}  # name -> list of feature vectors
+        # OpenCV DNN models are not thread-safe; Guard Mode scans faces from a worker thread
+        self._model_lock = threading.RLock()
 
         self._initialize_models()
         self.load_known_profiles()
@@ -83,8 +86,9 @@ class FaceRecognitionEngine:
             return None
 
         h, w = image.shape[:2]
-        self.detector.setInputSize((w, h))
-        _, faces = self.detector.detect(image)
+        with self._model_lock:
+            self.detector.setInputSize((w, h))
+            _, faces = self.detector.detect(image)
         return faces
 
     def extract_features(self, image: np.ndarray, face_box: np.ndarray) -> Optional[np.ndarray]:
@@ -92,8 +96,9 @@ class FaceRecognitionEngine:
         if not self.is_ready:
             return None
         try:
-            aligned_face = self.recognizer.alignCrop(image, face_box)
-            feature = self.recognizer.feature(aligned_face)
+            with self._model_lock:
+                aligned_face = self.recognizer.alignCrop(image, face_box)
+                feature = self.recognizer.feature(aligned_face)
             return feature
         except Exception as e:
             logger.debug(f"Failed to extract face features: {e}")
@@ -303,7 +308,8 @@ class FaceRecognitionEngine:
         for name, enrolled_feats in self.known_profiles.items():
             for ref_feat in enrolled_feats:
                 # SFace cosine similarity match
-                score = self.recognizer.match(test_feature, ref_feat, cv2.FaceRecognizerSF_FR_COSINE)
+                with self._model_lock:
+                    score = self.recognizer.match(test_feature, ref_feat, cv2.FaceRecognizerSF_FR_COSINE)
                 if score > best_score:
                     best_score = score
                     if score >= threshold:

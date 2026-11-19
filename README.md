@@ -91,6 +91,14 @@ All facial recognition runs **entirely on-device** using OpenCV ONNX runtime. No
 
 </td>
 </tr>
+<tr>
+<td colspan="2">
+
+### 🛡️ Guard Mode — Shortcut-Activated Watch Mode
+Stepping away for a minute without locking? Press your custom hotkey (default **`Ctrl+Shift+G`**) or type a secret password to arm Guard Mode. The moment **a face appears, a key is pressed, or the mouse/touchpad is touched**, IntruderLens silently snaps a photo. Owner's face = photo discarded. Anyone else = saved + alert sent.
+
+</td>
+</tr>
 </table>
 
 ---
@@ -170,6 +178,7 @@ IntruderLens/
 │
 ├── 📄 intruder_lens.py     # Core daemon: event listeners, camera pipeline, face decisions, CLI
 ├── 📄 face_engine.py       # Offline face detection (YuNet) + recognition (SFace) engine
+├── 📄 guard_mode.py        # Guard Mode: hotkey/password listener, input & face triggers
 ├── 📄 config.py            # All settings — thresholds, paths, alert credentials
 ├── 📄 download_models.py   # One-command ONNX model downloader from OpenCV Zoo
 ├── 📄 service_wrapper.py   # Optional native pywin32 Windows Service wrapper
@@ -297,6 +306,9 @@ python intruder_lens.py --test-lid
 
 # Test 3: Simulate 3 wrong passwords → triggers full capture pipeline
 python intruder_lens.py --test-failed-logon
+
+# Test 4: Arm Guard Mode immediately → touch keyboard/mouse or show your face
+python intruder_lens.py --test-guard
 ```
 
 ---
@@ -340,6 +352,43 @@ python intruder_lens.py --remove-face "Sister"
 
 ---
 
+## 🛡️ Using Guard Mode
+
+Guard Mode starts listening automatically with the daemon (`--run` / scheduled task). The screen stays unlocked; you simply arm it before walking away.
+
+| Action | Default |
+| :--- | :--- |
+| Activate Guard Mode | `Ctrl+Shift+G` |
+| Deactivate Guard Mode | `Ctrl+Shift+S` |
+
+After activation there is a **5 s arming delay** so you can step away. Once armed, any of these triggers a silent capture (each can be toggled in `config.py`):
+
+- 👤 a face appears in front of the webcam
+- ⌨️ any key is pressed
+- 🖱️ the mouse/touchpad is moved, clicked or scrolled
+
+Every capture goes through face recognition: **your face → photo discarded, nothing saved**; anyone else (or no face visible) → saved to `captures/guard_*.jpg` and Telegram/Email alert sent.
+
+> Keyboard/mouse triggers wait a short grace period (`GUARD_MODE_INPUT_GRACE_SECONDS`, 2 s) before capturing. If you deactivate within that window, the capture is cancelled — so your own deactivation keystrokes never cause an alert.
+
+**Customize the controls** in `config.py` or from the CLI (CLI values are saved to the git-ignored `intruder_lens.ini` and override `config.py`):
+
+```powershell
+# Custom hotkeys — 2 or 3 simultaneous keys each (same key for both = toggle)
+python intruder_lens.py --set-guard-shortcuts ctrl+alt+g ctrl+alt+u
+
+# Use a typed password instead (typed anywhere, no Enter needed)
+python intruder_lens.py --set-guard-password mysecret            # same password toggles on/off
+python intruder_lens.py --set-guard-password armme disarmme      # separate passwords
+
+# Switch back to hotkeys
+python intruder_lens.py --use-guard-shortcuts
+```
+
+> **Note:** Guard Mode needs the interactive desktop session (global keyboard/mouse hooks), so run it via `--run` or `--setup-task`, not the Session-0 Windows Service wrapper.
+
+---
+
 ## 📲 Setting Up Telegram Alerts *(Optional but Recommended)*
 
 Get the intruder's photo delivered to your phone in under 1 second:
@@ -376,6 +425,15 @@ All settings live in `config.py`. Key parameters:
 | `FACE_MATCH_THRESHOLD` | `0.35` | Cosine similarity cutoff (higher = stricter matching) |
 | `IGNORE_AUTHORIZED_FACES` | `True` | Suppress all alerts when owner/family detected |
 | `CAMERA_INDEX` | `0` | Webcam device index (0 = primary/built-in) |
+| `GUARD_MODE_ENABLED` | `True` | Start the Guard Mode listener with the daemon |
+| `GUARD_MODE_ACTIVATE_SHORTCUT` | `"ctrl+shift+g"` | Hotkey to arm Guard Mode |
+| `GUARD_MODE_DEACTIVATE_SHORTCUT` | `"ctrl+shift+s"` | Hotkey to disarm Guard Mode |
+| `GUARD_MODE_USE_PASSWORD` | `False` | Use a typed password instead of hotkeys |
+| `GUARD_MODE_PASSWORD` | `""` | Activation password (also deactivates unless a separate one is set) |
+| `GUARD_MODE_DEACTIVATE_PASSWORD` | `""` | Optional separate deactivation password |
+| `GUARD_MODE_TRIGGER_ON_FACE` / `_KEYPRESS` / `_MOUSE` | `True` | Which activity triggers a capture |
+| `GUARD_MODE_ARM_DELAY_SECONDS` | `5.0` | Time to step away after activating |
+| `GUARD_MODE_COOLDOWN_SECONDS` | `10.0` | Minimum gap between Guard Mode captures |
 | `TELEGRAM_ENABLED` | `False` | Enable Telegram Bot instant photo alerts |
 | `SMTP_ENABLED` | `False` | Enable Email instant photo alerts |
 
@@ -406,6 +464,7 @@ IntruderLens was designed with **privacy-first principles**:
 - [x] SMTP TLS email instant photo alerts
 - [x] Windows Scheduled Task silent autostart
 - [x] Built-in simulation & diagnostic CLI tools
+- [x] Guard Mode — hotkey/password-armed watch mode (face, keyboard, mouse/touchpad triggers)
 - [ ] Discord Webhook alert support
 - [ ] Mobile push notifications (Pushover / Pushbullet)
 - [ ] Offline alert queue — auto-dispatch when Wi-Fi reconnects
